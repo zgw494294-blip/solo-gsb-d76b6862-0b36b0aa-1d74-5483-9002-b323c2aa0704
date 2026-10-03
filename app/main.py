@@ -11,6 +11,7 @@ from . import storage as storage_module
 from .playback import (
     AcceptConflict,
     AckOutOfRange,
+    ChannelCapacityExhausted,
     ChannelExists,
     ChannelMissing,
     CursorRegression,
@@ -51,8 +52,15 @@ app = FastAPI(
         "enter/exit 按事件字段与排序入队（seq 从 1 连续编号），推进响应丢失后"
         "提交 ack_seq 补取未确认事件——只能确认此前补取已返回的最大 seq 以内的"
         "前缀，旧确认不回退；通道仅内存态，结束会话即清除，不跨重启恢复。"
+        "通道共享容量由 CHANNEL_EVENT_LIMIT 配置（正整数，默认 1024，非法配置"
+        "拒绝启动，可经 Compose 配置）：它是单进程内所有会话未确认事件总量的"
+        "上限；普通推进、事件推进与隐藏切换按本次实际事件数原子申请容量，与"
+        "状态变更、完整入队一同生效，不足立即 503（不推进游标、不改隐藏集合、"
+        "不消费 seq、不部分入队）；未开启通道不占容量，无事件操作满额仍可执行。"
+        "容量仅在确认并删除前缀或结束会话时释放（重复/并发结束不重复释放），"
+        "释放后原请求可重试。"
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -946,6 +954,26 @@ def _session_gone_404(session_id: str) -> HTTPException:
     )
 
 
+def _channel_full_503(exc: ChannelCapacityExhausted) -> HTTPException:
+    """共享补取容量不足：本次生产完整失败（503，可在确认/结束后重试）。
+
+    游标、隐藏集合、seq 与通道队列均未改变；客户端确认并删除部分前缀
+    （fetch 提交新的 ack_seq）或结束其他会话释放容量后，用原请求重试即可。
+    """
+    return HTTPException(
+        status_code=503,
+        detail={
+            "message": (
+                "补取通道未确认事件总量已达上限：本次事件无法完整入队，"
+                "状态未改变；确认前缀或结束会话释放容量后可重试原请求"
+            ),
+            "limit": exc.limit,
+            "requested": exc.requested,
+            "available": exc.available,
+        },
+    )
+
+
 def _get_session_or_404(session_id: str) -> PlaybackSession:
     session = get_playback().get(session_id)
     if session is None:
@@ -975,6 +1003,9 @@ def advance_session(session_id: str, req: AdvanceRequest) -> AdvanceResponse:
                 "time_ms": exc.time_ms,
             },
         )
+    except ChannelCapacityExhausted as exc:
+        # 共享容量不足：游标未推进、seq/队列未变，客户端可释放容量后重试
+        raise _channel_full_503(exc)
     return AdvanceResponse(**state)
 
 
@@ -996,6 +1027,8 @@ def advance_session_events(
     在会话锁内与推进、接纳、结束完整串行；事件不保存历史、不提供重放。
 
     倒退或非法时间返回 422 且会话不变；未知或已结束会话返回 404。
+    已开启通道且本次事件无法完整申请到共享容量时返回 503：游标不推进、
+    seq 不分配、事件不部分入队，释放容量后可用同一请求重试。
     """
     session = _get_session_or_404(session_id)
     try:
@@ -1011,6 +1044,8 @@ def advance_session_events(
                 "time_ms": exc.time_ms,
             },
         )
+    except ChannelCapacityExhausted as exc:
+        raise _channel_full_503(exc)
     return AdvanceEventsResponse(**state)
 
 
@@ -1040,7 +1075,9 @@ def set_hidden_speakers(
     切换与推进、事件推进、接纳、结束在会话锁内串行生效。
 
     未知或已结束会话返回 404；非法集合（非数组、空字符串、重复、
-    元素非字符串）返回 422；任何失败都不改变会话状态。
+    元素非字符串）返回 422；已开启通道但显示变更事件无法完整申请到
+    共享容量时返回 503（隐藏集合不改变、seq 不分配、事件不入队）；
+    任何失败都不改变会话状态。
     """
     session = _get_session_or_404(session_id)
     try:
@@ -1048,6 +1085,8 @@ def set_hidden_speakers(
     except SessionFinished:
         # 已取得引用但轮到生效时会话已被结束：与未知会话同等待遇
         raise _session_gone_404(session_id)
+    except ChannelCapacityExhausted as exc:
+        raise _channel_full_503(exc)
     return HiddenSpeakersResponse(**state)
 
 
@@ -1062,8 +1101,9 @@ def open_session_channel(session_id: str) -> ChannelOpenResponse:
     入队，seq 从 1 起连续编号，短字幕不漏记，接纳不重写已排队内容。
 
     重复开启返回 409（已有通道不变）；未知或已结束会话返回 404。开启与
-    既有会话操作在会话锁内完整串行。通道仅内存态：不跨重启恢复、不做
-    后台推送；结束会话即清除。
+    既有会话操作在会话锁内完整串行。开启只建立空队列、不占用共享容量
+    （容量由此后的生产操作按实际事件数申请）。通道仅内存态：不跨重启
+    恢复、不做后台推送；结束会话即清除并释放其占用的全部共享容量。
     """
     session = _get_session_or_404(session_id)
     try:
@@ -1095,7 +1135,9 @@ def fetch_session_channel(
     且通道不变；小于等于已确认位置的旧确认不回退。成功响应返回确认
     位置 acked_seq 与剩余未确认事件（seq > acked_seq，按 seq 递增）；
     未确认事件重复补取时内容与序号不变——推进响应丢失后用上次确认的
-    ack_seq 重试即可拿到完全相同的剩余事件。
+    ack_seq 重试即可拿到完全相同的剩余事件。只有“确认并删除前缀”才按
+    删除事件数释放共享容量：纯读取与旧确认不释放；满额导致生产得到
+    503 后，确认前缀即可腾出容量并用原请求重试。
 
     未开启通道、未知或已结束会话均返回 404；补取与开启及既有会话操作
     在会话锁内完整串行，任何失败都不改会话或通道。
@@ -1177,7 +1219,9 @@ def finish_session(session_id: str) -> SessionStateResponse:
       该 id 的一切请求（含此前已取得会话引用、在锁上等待的在途
       推进/事件推进/接纳）均返回 404；
     - 不改动源场景、其他会话或此前返回的快照；不保存结束记录，
-      会话不跨重启恢复（重启后同样按未知会话返回 404）。
+      会话不跨重启恢复（重启后同样按未知会话返回 404）；
+    - 已开启补取通道时，结束还会一次性释放该通道剩余未确认事件占用的
+      共享容量；重复或并发结束最多一次成功，容量不会重复释放。
     """
     try:
         state = get_playback().finish(session_id)

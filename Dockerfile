@@ -3,7 +3,8 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    SCENES_DB_PATH=/data/scenes.db
+    SCENES_DB_PATH=/data/scenes.db \
+    CHANNEL_EVENT_LIMIT=1024
 
 WORKDIR /app
 
