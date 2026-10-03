@@ -12,6 +12,7 @@
 - 2～4 个已保存场景可按给定顺序**拼接（concat）为连续播放场景**：`POST /scenes/concat` 接收非空 `target_scene_id` 与 2～4 段（每段给出非空 `scene_id`、正整数 `expected_revision` 与正整数 `duration_ms`，同源可重复，整数拒绝布尔值和字符串）；各源轨道数须相同，每段时长不得小于该源字幕的最大 `end_ms`，拼接后字幕总数 ≤ 12。字幕起止时间加上之前各段时长之和，按段序、源顺序排列，id 为“段号:段内序号”（均从 1 起），speaker 不变，源实际分轨写入 `locked_track`，`changes` 按拼接后同说话人时间相邻字幕计算（跨段相邻计入）。读取与提交时均核对全部源版本，**提交核对和目标创建在同一事务内一同生效**：源不存在 404、版本不符或目标已占用 409、其余非法输入 422；失败不留目标、不改源及播放会话。成功保存为版本 1 并返回完整场景，可直接用原读取、修订及播放接口操作。
 - 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。播放时还可通过 `/hidden_speakers` **临时隐藏指定说话人的字幕（仅影响该会话、不持久化）**：按 `speaker` 精确匹配，提交无重复非空字符串数组（空数组清除，允许尚未出现者）；切换时以当前游标的左闭右开活动区间判定，原可见而现隐藏者发 `exit`、原隐藏而现可见者发 `enter`（时刻为当前游标，先 `exit` 后 `enter`，同类按会话字幕顺序，无变化则无事件）；设置后推进与事件推进的活动字幕、事件均排除隐藏者而游标照常推进，隐藏默认空、接纳后保留，完整快照与分轨不受影响。播放结束以 `POST /sessions/{id}/finish` **一次完整操作取回最终快照并释放会话**：成功响应沿用创建会话的全部字段，快照取自轮到结束时的会话（不读取尚未接纳的场景修订），未知会话返回 404；结束与同会话的推进、事件推进、隐藏切换、接纳串行生效，并发结束最多一次成功，结束后针对该 id 的一切请求（含已取得会话引用但尚未生效的请求）均返回 404；不改动源场景、其他会话或此前返回的快照，不保存结束记录、不跨重启恢复。
 - 播放会话可开启一个**补取通道（channel）**，让显示端在**推进响应丢失后仍能补取未确认的字幕变更**：`POST /sessions/{id}/channel` 每会话开启一个内存通道（重复开启 409），返回当前可见 `active` 与序号 0；此后普通推进、事件推进与隐藏切换产生的全部 enter/exit 按事件字段与排序入队，`seq` 从 1 连续编号，短字幕不漏记，接纳不重写已排队内容。`POST /sessions/{id}/channel/fetch` 提交 `ack_seq`（严格非负整数，拒绝布尔值与字符串）补取：只能确认此前补取已返回的最大 `seq` 以内的前缀（越界 422，旧确认不回退），返回确认位置与剩余未确认事件（按 `seq` 递增，重复补取内容与序号不变）。状态变更与入队一同生效，开启、补取与既有会话操作完整串行，失败不改会话或通道；结束会话清除通道，未知或已结束会话、未开启通道均 404。通道仅内存态：不跨重启恢复、不做后台推送，旧接口响应不变。
+- **通道容量全进程共享**：环境变量 `CHANNEL_EVENT_LIMIT`（正整数，**默认 1024**，可在 Docker Compose 配置；非法配置拒绝启动）限制单进程内**全部会话**未确认事件的总条数。普通推进、事件推进与隐藏切换都按**本次实际生成的事件数**在会话锁内先申请共享容量，再与状态变更、完整入队一同生效；容量不足立即返回 **503**——不推进游标、不改变隐藏集合、不消费 `seq`、不部分入队，容量经确认或结束释放后**同一请求可原样重试**。**未开启通道的操作不占容量**；等时推进等**零事件操作在满额时仍可执行**。容量**只在补取确认并实际删除前缀时**按删除条数释放（纯读取、旧确认不释放）；`/finish` 结束会话时释放该通道剩余队列，重复或并发结束不会重复释放。
 
 ## 一条命令启动
 
@@ -25,6 +26,7 @@ docker compose up --build -d
 
 > - 交互式查看日志可去掉 `-d`。交互式文档：`http://localhost:8080/docs`（Swagger UI）。
 > - Compose 自动把具名卷 `scenes-data` 挂载到容器内 `/data`：场景数据库（`SCENES_DB_PATH=/data/scenes.db`）在容器重启甚至 `docker compose down && up` 后仍然保留。仅 `docker compose down -v` 删除卷时才会清除场景。
+> - 补取通道的全进程共享容量可用 `CHANNEL_EVENT_LIMIT` 配置（正整数，默认 1024），例如 `CHANNEL_EVENT_LIMIT=2048 docker compose up --build -d`；未设置取默认值，`0`、负数或非数字等非法配置会让服务拒绝启动。
 
 ## 请求
 
@@ -1408,6 +1410,82 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/
   - 成功响应返回**确认位置 `acked_seq` 与剩余未确认事件**（`seq > acked_seq`，按 `seq` 递增）；已确认前缀随即丢弃，未确认事件**重复补取时内容与序号不变**——推进响应丢失后，用上次已确认的 `ack_seq` 重试即可拿到完全相同的剩余事件。
 - 结束会话（`/finish`）**清除通道**；未知或已结束会话、未开启通道的补取均返回 **404**。通道只存在于会话内存中：**不跨重启恢复、不做后台推送**（拉取式）；旧接口（创建/推进/事件推进/隐藏切换/接纳/结束）的响应完全不变。
 
+### 共享容量（CHANNEL_EVENT_LIMIT）：满额 503、确认释放、原请求重试
+
+全部已开启通道**共享**一个未确认事件总量，由环境变量 `CHANNEL_EVENT_LIMIT` 控制（正整数，**默认 1024**；在 `docker-compose.yml` 的 environment 中可配置，也可在宿主机 `CHANNEL_EVENT_LIMIT=2048 docker compose up --build -d` 覆盖；未设置取默认值，`0`、负数、小数、布尔值与其他非数字写法一律**拒绝启动**）。容量规则：
+
+- **按本次实际生成的事件数申请**：普通推进、事件推进、隐藏切换在会话锁内先申请 `len(events)` 个共享名额，再与游标推进/隐藏集合替换/完整入队一同生效。容量不足立即返回 **503**，本次操作**整体不生效**——游标不推进、隐藏集合不变、`seq` 不消费、不部分入队、不留任何占用。
+- **未开启通道的操作不占容量**；**零事件操作（等时推进、无变化的隐藏切换等）在满额时仍返回 200**；倒退等既有 422 语义与顺序不变（先做既有校验，再申请容量）。
+- **只在确认并删除前缀时释放**：`/channel/fetch` 仅当 `ack_seq` 使确认位置前进、实际丢弃前缀时，按**删除条数**归还容量；纯读取（`ack_seq` 不前进）与旧确认（小于等于已确认位置）**不释放**。
+- **结束释放剩余队列且仅一次**：`/finish` 归还该通道现存未确认事件占用的全部容量；重复或并发结束不会重复释放（并发结束最多一次成功）。
+- **释放后原请求可重试**：被 503 拒绝的推进/隐藏切换没有任何副作用，待对端确认（或相关会话结束）腾出名额后，用**完全相同的请求体**重发即可；不同会话的并发生产合计绝不突破总额。
+
+503 响应体给出本次申请量、上限与当前在用量：
+
+```json
+{"detail": {"message": "补取通道未确认事件总量已满：…请先经 channel/fetch 确认已收到的事件前缀（或等待通道结束释放）后原样重试",
+            "requested": 2, "channel_event_limit": 2, "in_use": 2}}
+```
+
+### 示例 28：满额 503、确认释放与原请求重试
+
+以很小的上限启动便于演示（其余场景与会话创建步骤同示例 26）：
+
+```bash
+CHANNEL_EVENT_LIMIT=2 docker compose up --build -d
+# 本地非 Docker 运行：CHANNEL_EVENT_LIMIT=2 uvicorn app.main:app --port 8080
+```
+
+场景含两条互不重叠的字幕 a `[100,800)`、b `[1100,1800)`，开启通道后先推进到 1000——产生 a 的 enter/exit 两条，恰好占满 2 个名额：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}'
+# 200
+```
+
+再推进到 2000 还需 b 的 enter/exit 两个名额，容量已满：**立即 503，游标不动、seq 不消费、不部分入队**：
+
+```bash
+curl -s -i -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 2000}'
+# HTTP/1.1 503 Service Unavailable
+# {"detail":{"message":"补取通道未确认事件总量已满：…原样重试",
+#            "requested":2,"channel_event_limit":2,"in_use":2}}
+```
+
+满额时**零事件操作照常执行**（等时推进 200）；纯读取**不释放**容量，之后生产仍是 503：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}'          # 200（零事件）
+curl -s -o /dev/null -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 0}'             # 纯读取，不释放
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 2000}'          # 仍 503
+```
+
+先补取看到 seq 1、2，再确认到 2（前缀被实际删除，释放 2 个名额），随后用**完全相同的请求体**重试即成功；也可以直接结束占用容量的会话来释放（`POST /sessions/{id}/finish`，重复结束返回 404 且不会重复释放）：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 0}'             # 看到 seq 1、2
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 2}'
+# {"session_id":"…","acked_seq":2,"events":[]}                        # 删除前缀，容量归零
+curl -s -w '\nHTTP %{http_code}\n' -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 2000}'
+# {"events":[…b 的 enter/exit…], …}
+# HTTP 200
+```
+
+非法配置在启动阶段即被拒绝（容器不断重启或命令直接报错退出，不接受任何请求）：
+
+```bash
+CHANNEL_EVENT_LIMIT=0 docker compose up --build
+# ValueError: CHANNEL_EVENT_LIMIT 必须为正整数（十进制，不含空白或其他字符），非法配置：'0'
+```
+
 ### 示例 26：开启通道与丢响应后补取
 
 创建场景 `scene-chan`（s1 `[0,1000)`、s2 `[800,3000)` 锁轨 2、s3 `[1000,2500)`，分轨 1/2/1）并创建会话，然后开启补取通道：
@@ -1568,7 +1646,7 @@ uvicorn app.main:app --reload --port 8080
 pytest
 ```
 
-本地（非 Docker）运行时，场景数据库默认写入工作目录下的 `scenes.db`；可用环境变量改到别处，例如 `SCENES_DB_PATH=/tmp/scenes.db uvicorn app.main:app --port 8080`。
+本地（非 Docker）运行时，场景数据库默认写入工作目录下的 `scenes.db`；可用环境变量改到别处，例如 `SCENES_DB_PATH=/tmp/scenes.db uvicorn app.main:app --port 8080`。补取通道的全进程共享未确认事件总量用 `CHANNEL_EVENT_LIMIT` 配置（正整数，默认 1024；非法值拒绝启动），例如 `CHANNEL_EVENT_LIMIT=2048 uvicorn app.main:app --port 8080`。
 
 核心求解器（`app/solver.py`）无第三方依赖，也可直接运行其测试：
 
@@ -1594,7 +1672,7 @@ app/
   main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip、场景拼接 /scenes/concat、会话结束 /sessions/{id}/finish 与补取通道 /sessions/{id}/channel(/fetch)
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段/拼接核对全部源版本与创建目标为同一事务）
-  playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/补取通道/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表；通道记录全部 enter/exit 供丢响应后补取确认）与保轨重算
+  playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/补取通道/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表；通道记录全部 enter/exit 供丢响应后补取确认；CHANNEL_EVENT_LIMIT 跨会话共享未确认事件容量，不足 503、确认/结束释放）与保轨重算
 tests/
   conftest.py            # pytest 夹具（场景接口使用临时数据库、会话隔离）
   test_solver.py         # 求解器单元测试
@@ -1606,6 +1684,7 @@ tests/
   test_hidden_speakers.py # 临时隐藏说话人：切换事件顺序、推进/事件排除、接纳保留、快照不变、404/422、串行化
   test_finish.py         # 会话结束：最终快照字段、404、不读未接纳修订、并发结束唯一成功、等待中的推进/事件推进/接纳/重复结束可控交错
   test_channel.py        # 补取通道：开启/重复开启、三类操作入队与短字幕、ack 边界与不回退、重复补取不变、结束清除、404/409/422、串行化
+  test_channel_limit.py  # 通道共享容量：默认/非法配置拒绝启动、按实际事件数申请与满额 503 原子性、无通道/零事件不占、跨会话共享、确认/结束释放与重试、并发不突破/不死锁/不泄漏
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data
 requirements.txt / requirements-dev.txt

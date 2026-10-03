@@ -8,6 +8,11 @@ services:
     environment:
       # 容器内数据库文件路径（与 Dockerfile 的默认值一致）
       SCENES_DB_PATH: /data/scenes.db
+      # 进程内全部补取通道共享的未确认事件总量上限（正整数，默认 1024）。
+      # 未设置或留空取默认值；0、负数或非数字等非法配置会拒绝启动。
+      # 可在宿主机导出后覆盖，例如：
+      #   CHANNEL_EVENT_LIMIT=2048 docker compose up --build -d
+      CHANNEL_EVENT_LIMIT: ${CHANNEL_EVENT_LIMIT:-1024}
     volumes:
       # 具名卷持久化 SQLite 场景数据；容器重启甚至重新创建后仍可读取场景
       - scenes-data:/data

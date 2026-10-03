@@ -40,6 +40,13 @@
   返回确认位置与剩余未确认事件（按 seq 递增，重复补取内容与序号不变）。
   状态变更与入队在同一会话锁内一同生效，开启、补取与既有会话操作完整
   串行，失败不改会话或通道。通道仅内存态：不跨重启恢复、不做后台推送。
+  进程内全部会话的通道共享一个未确认事件总量上限
+  （CHANNEL_EVENT_LIMIT，正整数，默认 1024）：普通推进、事件推进与
+  隐藏切换按本次实际生成的事件数在会话锁内先申请共享容量，再与状态变更、
+  完整入队一同生效；容量不足整体失败（503），不推进游标、不改变隐藏
+  集合、不消费 seq、不部分入队。未开启通道的操作不占容量，零事件操作在
+  满额时仍可执行。容量仅在补取确认并删除前缀时按删除条数归还（读取与旧
+  确认不归还）；结束会话归还该通道剩余队列且仅归还一次。
 
 会话只存在于本进程内存中，不随重启保留。同一会话上的推进、事件推进、
 隐藏切换、接纳、结束与补取通道的开启/补取通过会话级互斥锁串行化：
@@ -137,6 +144,87 @@ class AckOutOfRange(Exception):
             f"ack_seq={ack_seq} 越界：此前补取已返回的最大 seq 为 "
             f"{max_returned_seq}"
         )
+
+
+class ChannelCapacityExceeded(Exception):
+    """本次操作实际产生的事件数无法获得共享容量（对应 HTTP 503，整体失败）。
+
+    补取通道的未确认事件总量按进程内全部会话共享：申请量使在用量超过
+    CHANNEL_EVENT_LIMIT 时抛出。失败操作不推进游标、不改变隐藏集合、
+    不消费 seq、不部分入队、不占用任何容量；容量经确认删除或结束释放后
+    原请求可原样重试。
+    """
+
+    def __init__(self, requested: int, limit: int, in_use: int) -> None:
+        self.requested = requested
+        self.limit = limit
+        self.in_use = in_use
+        super().__init__(
+            f"补取通道未确认事件总量已满：本次申请 {requested} 条，"
+            f"上限 {limit} 条，当前已用 {in_use} 条"
+        )
+
+
+# 进程内全部补取通道共享的未确认事件总量默认上限；可用环境变量
+# CHANNEL_EVENT_LIMIT 覆盖（正整数字符串），非法配置拒绝启动。
+DEFAULT_CHANNEL_EVENT_LIMIT = 1024
+
+
+def channel_event_limit_from_env(
+    raw: Optional[str], *, default: int = DEFAULT_CHANNEL_EVENT_LIMIT
+) -> int:
+    """解析 CHANNEL_EVENT_LIMIT：未设置取默认值；显式空串/空白视为非法。
+
+    仅接受纯十进制正整数（"1024"）：空串、0、负数、小数、科学计数法、
+    布尔值、含空白或其他字符的写法一律抛 ValueError——启动阶段据此拒绝
+    启动。Python 对超大整数原生支持，不设人为上限。
+    """
+    if raw is None:
+        return default
+    if not raw or not raw.isascii() or not raw.isdigit() or int(raw) <= 0:
+        raise ValueError(
+            "CHANNEL_EVENT_LIMIT 必须为正整数（十进制，不含空白或其他字符），"
+            f"非法配置：{raw!r}"
+        )
+    return int(raw)
+
+
+class ChannelCapacity:
+    """进程内全部补取通道共享的未确认事件总量（内存态，不持久化）。
+
+    in_use 为当前所有已开启通道中“已入队且未被确认删除”的事件总数。
+    生产方在会话锁内先 reserve 本次实际生成的事件数，再做状态变更与完整
+    入队——reserve 不足即整体失败，不留下任何占用；确认删除前缀与结束
+    通道时按实际条数 release。容量锁只在会话锁内短暂持有，从不反向等待
+    会话锁或注册表锁，因此与确认、结束、生产并发时不会死锁。
+    """
+
+    def __init__(self, limit: int) -> None:
+        if limit <= 0:
+            raise ValueError("通道事件容量上限必须为正整数")
+        self.limit = limit
+        self.in_use = 0
+        self._lock = threading.Lock()
+
+    def reserve(self, count: int) -> None:
+        """申请 count 个事件容量；不足抛 ChannelCapacityExceeded（不占用）。"""
+        if count <= 0:
+            return
+        with self._lock:
+            if self.in_use + count > self.limit:
+                raise ChannelCapacityExceeded(count, self.limit, self.in_use)
+            self.in_use += count
+
+    def release(self, count: int) -> None:
+        """归还 count 个事件容量（确认删除前缀 / 结束通道时调用）。"""
+        if count <= 0:
+            return
+        with self._lock:
+            self.in_use -= count
+            # 容量恒等于各通道现存未确认事件之和，不得泄漏成负数
+            if self.in_use < 0:
+                self.in_use = 0
+                raise RuntimeError("补取通道共享容量被超额释放")
 
 
 @dataclass
@@ -264,7 +352,8 @@ def _channel_enqueue(
 
     与产生事件的状态变更（游标推进、隐藏集合替换）在同一会话锁内一同
     生效：seq 从 1 起连续分配；已排队内容自此不被改写（接纳场景修订
-    也不影响）。调用方须已持有会话锁。
+    也不影响）。调用方须已先通过 ChannelCapacity.reserve 按本批事件数
+    申请到共享容量（未开启通道时无需申请），并已持有会话锁。
     """
     channel = session.channel
     if channel is None:
@@ -282,9 +371,14 @@ class PlaybackManager:
     注册表锁等待会话锁，因此不存在反向等待、不会死锁。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        channel_event_limit: int = DEFAULT_CHANNEL_EVENT_LIMIT,
+    ) -> None:
         self._sessions: Dict[str, PlaybackSession] = {}
         self._registry_lock = threading.Lock()
+        # 进程内全部会话的通道共享同一未确认事件总量
+        self._channel_capacity = ChannelCapacity(channel_event_limit)
 
     def create(self, record: SceneRecord) -> Dict[str, Any]:
         """按场景当前快照创建会话：复制完整快照，游标从 0 毫秒开始。"""
@@ -308,12 +402,23 @@ class PlaybackManager:
         with self._registry_lock:
             return self._sessions.get(session_id)
 
+    @property
+    def channel_event_limit(self) -> int:
+        return self._channel_capacity.limit
+
+    @property
+    def channel_events_in_use(self) -> int:
+        return self._channel_capacity.in_use
+
     def advance(self, session: PlaybackSession, time_ms: int) -> Dict[str, Any]:
         """推进游标（只能不减），返回源版本、游标与活动字幕及轨道。
 
         响应保持原样（不含事件）；若已开启补取通道，本次推进跨过的全部
-        进入/退出事件（与事件推进同一窗口与排序，短字幕不漏记）在游标
-        更新的同一会话锁内一并入队。
+        进入/退出事件（与事件推进同一窗口与排序，短字幕不漏记）先按实际
+        条数申请进程内共享容量，再与游标更新、完整入队在同一会话锁内一同
+        生效。容量不足抛 ChannelCapacityExceeded（503）：游标不推进、
+        seq 不消费、不部分入队；未开启通道或零事件不占容量，满额时仍可
+        推进。
         """
         with session.lock:
             if session.closed:
@@ -327,6 +432,8 @@ class PlaybackManager:
                 if session.channel is not None
                 else []
             )
+            # 容量先于状态变更申请：不足则整体失败，会话与通道均不变
+            self._channel_capacity.reserve(len(pending))
             session.cursor_ms = time_ms
             _channel_enqueue(session, pending)
             return {
@@ -353,7 +460,10 @@ class PlaybackManager:
         内一次完成，与推进、接纳、结束完整串行。倒退抛 CursorRegression，
         会话保持不变。事件不保存历史、不提供重放。隐藏说话人的字幕不
         进入 active，也不产生事件；游标仍照常推进。若已开启补取通道，
-        本次事件在游标更新的同一会话锁内按序入队。
+        本次事件先按实际条数申请进程内共享容量，再与游标更新、完整入队
+        一同生效；容量不足抛 ChannelCapacityExceeded（503）：游标不推进、
+        seq 不消费、不部分入队。未开启通道不占容量；零事件推进在满额时
+        仍可执行。
         """
         with session.lock:
             if session.closed:
@@ -362,6 +472,10 @@ class PlaybackManager:
                 raise CursorRegression(session.cursor_ms, time_ms)
             old_cursor = session.cursor_ms
             events = _window_events(session, old_cursor, time_ms)
+            # 仅已开启通道时占用共享容量：申请先于游标更新与入队，
+            # 不足则本次推进整体失败（响应事件同样不返回）
+            if session.channel is not None:
+                self._channel_capacity.reserve(len(events))
             session.cursor_ms = time_ms
             _channel_enqueue(session, events)
             return {
@@ -394,6 +508,10 @@ class PlaybackManager:
         游标照常推进；完整快照（state()/finish）、分轨与冻结规则不变。
         设置仅存于会话内存、不持久化，接纳不改变隐藏集合。与推进、事件
         推进、接纳、结束在会话锁内完整串行；会话已结束抛 SessionFinished。
+        已开启通道时，显示变更事件先按实际条数申请进程内共享容量，再与
+        隐藏集合替换、完整入队一同生效；容量不足抛 ChannelCapacityExceeded
+        （503）：隐藏集合不变、seq 不消费、不部分入队。未开启通道不占
+        容量；集合无变化（零事件）在满额时仍可切换。
         """
         with session.lock:
             if session.closed:
@@ -428,6 +546,9 @@ class PlaybackManager:
             events = [item[1] for item in exits] + [
                 item[1] for item in enters
             ]
+            # 容量先于隐藏集合替换申请：不足则集合不变、入队不发生
+            if session.channel is not None:
+                self._channel_capacity.reserve(len(events))
             session.hidden_speakers = new_hidden
             # 与隐藏集合的替换一同生效：显示变更事件同步入队（未开启则无操作）
             _channel_enqueue(session, events)
@@ -473,10 +594,13 @@ class PlaybackManager:
         ack_seq 只能确认此前补取已返回的最大 seq 以内的前缀：越界抛
         AckOutOfRange（422，通道不变）；小于等于已确认位置的旧确认不
         回退。成功时确认位置前进到 max(acked_seq, ack_seq)，丢弃已确认
-        前缀，返回确认位置与剩余未确认事件（按 seq 递增；内容与序号自
-        入队起不变，重复补取结果相同），并把“已返回的最大 seq”推进到
-        本次返回的末尾。未开启通道抛 ChannelMissing（404）；会话已结束
-        抛 SessionFinished（404）。与既有会话操作在会话锁内完整串行。
+        前缀，并按本次实际删除的条数归还进程内共享容量——纯读取（确认
+        位置不前进、无删除）与旧确认不释放任何容量，因此读不到新事件时
+        不能靠补取腾出容量，生产方需等待真实确认后重试。返回确认位置与
+        剩余未确认事件（按 seq 递增；内容与序号自入队起不变，重复补取
+        结果相同），并把“已返回的最大 seq”推进到本次返回的末尾。
+        未开启通道抛 ChannelMissing（404）；会话已结束抛
+        SessionFinished（404）。与既有会话操作在会话锁内完整串行。
         """
         with session.lock:
             if session.closed:
@@ -486,13 +610,20 @@ class PlaybackManager:
                 raise ChannelMissing(session.session_id)
             if ack_seq > channel.max_returned_seq:
                 raise AckOutOfRange(ack_seq, channel.max_returned_seq)
-            if ack_seq > channel.acked_seq:
-                channel.acked_seq = ack_seq
-            # 丢弃已确认前缀；剩余事件保持入队时的内容与序号、按 seq 递增
-            if channel.events and channel.events[0]["seq"] <= channel.acked_seq:
-                channel.events = [
-                    e for e in channel.events if e["seq"] > channel.acked_seq
-                ]
+            new_acked = channel.acked_seq
+            if ack_seq > new_acked:
+                new_acked = ack_seq
+            # 丢弃新确认的前缀；仅本次实际删除的条数释放共享容量，
+            # 纯读取与旧确认（无删除）不释放。剩余事件保持入队时的
+            # 内容与序号、按 seq 递增。
+            deleted = 0
+            if channel.events and channel.events[0]["seq"] <= new_acked:
+                kept = [e for e in channel.events if e["seq"] > new_acked]
+                deleted = len(channel.events) - len(kept)
+                channel.events = kept
+            channel.acked_seq = new_acked
+            if deleted:
+                self._channel_capacity.release(deleted)
             remaining = [dict(e) for e in channel.events]
             if remaining:
                 channel.max_returned_seq = remaining[-1]["seq"]
@@ -609,8 +740,13 @@ class PlaybackManager:
             if session.closed:
                 raise SessionFinished(session_id)
             session.closed = True
-            # 结束会话清除补取通道（通道本就只是会话内存态）
-            session.channel = None
+            # 结束会话清除补取通道（通道本就只是会话内存态）：
+            # 归还该通道现存未确认事件占用的共享容量。closed 检查保证
+            # 并发结束只有一个请求到达此处，因此剩余容量只释放一次。
+            channel = session.channel
+            if channel is not None:
+                self._channel_capacity.release(len(channel.events))
+                session.channel = None
             with self._registry_lock:
                 # 注册表条目即本对象；以 closed 为准，防御性地按 id 移除
                 self._sessions.pop(session_id, None)

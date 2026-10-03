@@ -1,6 +1,8 @@
 """FastAPI 入口：请求/响应模型与路由。"""
 from __future__ import annotations
 
+import os
+from contextlib import asynccontextmanager
 from threading import Lock
 from typing import List, Literal, Optional, Union
 
@@ -11,6 +13,7 @@ from . import storage as storage_module
 from .playback import (
     AcceptConflict,
     AckOutOfRange,
+    ChannelCapacityExceeded,
     ChannelExists,
     ChannelMissing,
     CursorRegression,
@@ -19,6 +22,7 @@ from .playback import (
     SceneUnavailable,
     SessionFinished,
     SessionMissing,
+    channel_event_limit_from_env,
 )
 from .solver import Subtitle, solve, validate
 from .storage import (
@@ -29,8 +33,22 @@ from .storage import (
     TargetSceneExists,
 )
 
+
+def channel_event_limit() -> int:
+    """读取 CHANNEL_EVENT_LIMIT：未设置取默认值 1024，显式非法值抛 ValueError。"""
+    return channel_event_limit_from_env(os.environ.get("CHANNEL_EVENT_LIMIT"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动即校验：非法 CHANNEL_EVENT_LIMIT 让 uvicorn 启动失败，不接受请求
+    channel_event_limit()
+    yield
+
+
 app = FastAPI(
     title="对白字幕分轨 API",
+    lifespan=lifespan,
     description=(
         "为离线对白字幕分配屏幕轨道：时间重叠的字幕不同轨，"
         "同一说话人按时间相邻字幕的换轨次数最少，并列取轨道号序列字典序最小者。"
@@ -51,8 +69,15 @@ app = FastAPI(
         "enter/exit 按事件字段与排序入队（seq 从 1 连续编号），推进响应丢失后"
         "提交 ack_seq 补取未确认事件——只能确认此前补取已返回的最大 seq 以内的"
         "前缀，旧确认不回退；通道仅内存态，结束会话即清除，不跨重启恢复。"
+        "进程内全部会话的通道共享未确认事件总量（CHANNEL_EVENT_LIMIT，正整数，"
+        "默认 1024，非法配置拒绝启动）：普通推进、事件推进与隐藏切换按本次实际"
+        "生成的事件数先申请共享容量，再与状态变更、完整入队一同生效；容量不足"
+        "立即 503，不推进游标、不改变隐藏集合、不消费 seq、不部分入队；未开启"
+        "通道的操作不占容量，零事件操作在满额时仍可执行。容量仅在补取确认并"
+        "删除前缀时按删除条数释放（读取与旧确认不释放）；结束会话释放剩余队列"
+        "且仅一次，释放后原请求可重试。"
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -450,6 +475,11 @@ def reset_store() -> None:
 
 # ---------------------------------------------------------------------------
 # 播放会话管理器：单进程内存，不持久化、不跨重启保留
+#
+# 补取通道的未确认事件总量在单进程内全部会话间共享，上限取环境变量
+# CHANNEL_EVENT_LIMIT（正整数，默认 1024）。启动时（lifespan）与管理器
+# 首次创建时各解析一次：非法配置让启动直接失败（uvicorn 退出，不接受
+# 请求）。
 # ---------------------------------------------------------------------------
 
 _playback: Optional[PlaybackManager] = None
@@ -461,7 +491,9 @@ def get_playback() -> PlaybackManager:
     if _playback is None:
         with _playback_lock:
             if _playback is None:
-                _playback = PlaybackManager()
+                # 解析在双重检查锁内完成：正常启动已由 lifespan 校验过，
+                # 此处覆盖不经 lifespan 的直接使用（如测试）。
+                _playback = PlaybackManager(channel_event_limit())
     return _playback
 
 
@@ -953,12 +985,33 @@ def _get_session_or_404(session_id: str) -> PlaybackSession:
     return session
 
 
+def _channel_full_503(exc: ChannelCapacityExceeded) -> HTTPException:
+    """共享通道容量不足：立即 503；本次操作完全未生效，释放后可原样重试。"""
+    return HTTPException(
+        status_code=503,
+        detail={
+            "message": (
+                "补取通道未确认事件总量已满：本次操作实际产生的事件无法"
+                "全部入队，操作未生效；请先经 channel/fetch 确认已收到的"
+                "事件前缀（或等待通道结束释放）后原样重试"
+            ),
+            "requested": exc.requested,
+            "channel_event_limit": exc.limit,
+            "in_use": exc.in_use,
+        },
+    )
+
+
 @app.post("/sessions/{session_id}/advance", response_model=AdvanceResponse)
 def advance_session(session_id: str, req: AdvanceRequest) -> AdvanceResponse:
     """推进游标到 time_ms（非负整数，只能不减）。
 
     返回源版本、游标，以及游标时刻处于 [start_ms, end_ms) 区间的字幕
     及其轨道。倒退返回 422 且会话不变；未知或已结束会话返回 404。
+    已开启补取通道时，本次推进实际跨过的事件数须先获得进程内共享容量：
+    容量不足立即返回 503，游标不推进、不消费 seq、不部分入队；未开启
+    通道不占容量，等时推进等零事件操作在满额时仍可执行；容量经确认
+    释放后可用同一请求体重试。
     """
     session = _get_session_or_404(session_id)
     try:
@@ -975,6 +1028,8 @@ def advance_session(session_id: str, req: AdvanceRequest) -> AdvanceResponse:
                 "time_ms": exc.time_ms,
             },
         )
+    except ChannelCapacityExceeded as exc:
+        raise _channel_full_503(exc)
     return AdvanceResponse(**state)
 
 
@@ -996,6 +1051,10 @@ def advance_session_events(
     在会话锁内与推进、接纳、结束完整串行；事件不保存历史、不提供重放。
 
     倒退或非法时间返回 422 且会话不变；未知或已结束会话返回 404。
+    已开启补取通道时，本次实际生成的事件数须先获得进程内共享容量：
+    容量不足立即返回 503，游标不推进、不消费 seq、不部分入队（本次
+    事件也不返回）；未开启通道不占容量，等时推进等零事件操作在满额时
+    仍可执行；容量经确认释放后可原样重试。
     """
     session = _get_session_or_404(session_id)
     try:
@@ -1011,6 +1070,8 @@ def advance_session_events(
                 "time_ms": exc.time_ms,
             },
         )
+    except ChannelCapacityExceeded as exc:
+        raise _channel_full_503(exc)
     return AdvanceEventsResponse(**state)
 
 
@@ -1040,7 +1101,11 @@ def set_hidden_speakers(
     切换与推进、事件推进、接纳、结束在会话锁内串行生效。
 
     未知或已结束会话返回 404；非法集合（非数组、空字符串、重复、
-    元素非字符串）返回 422；任何失败都不改变会话状态。
+    元素非字符串）返回 422；任何失败都不改变会话状态。已开启补取通道
+    时，本次切换实际产生的显示变更事件数须先获得进程内共享容量：容量
+    不足立即返回 503，隐藏集合不变、不消费 seq、不部分入队；未开启
+    通道不占容量，集合无变化等零事件操作在满额时仍可执行；容量经确认
+    释放后可原样重试。
     """
     session = _get_session_or_404(session_id)
     try:
@@ -1048,6 +1113,8 @@ def set_hidden_speakers(
     except SessionFinished:
         # 已取得引用但轮到生效时会话已被结束：与未知会话同等待遇
         raise _session_gone_404(session_id)
+    except ChannelCapacityExceeded as exc:
+        raise _channel_full_503(exc)
     return HiddenSpeakersResponse(**state)
 
 
@@ -1060,6 +1127,9 @@ def open_session_channel(session_id: str) -> ChannelOpenResponse:
     之前的事件不补记，客户端以本响应的 active 作为初始可见集合。此后
     普通推进、事件推进与隐藏切换产生的全部 enter/exit 按事件字段与排序
     入队，seq 从 1 起连续编号，短字幕不漏记，接纳不重写已排队内容。
+    全部会话的通道共享 CHANNEL_EVENT_LIMIT（默认 1024）个未确认事件
+    容量，按各次操作实际生成的事件数在状态变更前申请，不足时那些操作
+    返回 503 且整体不生效；开启本身不占容量。
 
     重复开启返回 409（已有通道不变）；未知或已结束会话返回 404。开启与
     既有会话操作在会话锁内完整串行。通道仅内存态：不跨重启恢复、不做
@@ -1095,7 +1165,10 @@ def fetch_session_channel(
     且通道不变；小于等于已确认位置的旧确认不回退。成功响应返回确认
     位置 acked_seq 与剩余未确认事件（seq > acked_seq，按 seq 递增）；
     未确认事件重复补取时内容与序号不变——推进响应丢失后用上次确认的
-    ack_seq 重试即可拿到完全相同的剩余事件。
+    ack_seq 重试即可拿到完全相同的剩余事件。仅当确认导致前缀被实际
+    删除时才按删除条数释放进程内共享容量：纯读取与旧确认不释放容量，
+    因此满额时必须由真实确认（或结束通道）腾出容量后，生产请求才能
+    重试成功。
 
     未开启通道、未知或已结束会话均返回 404；补取与开启及既有会话操作
     在会话锁内完整串行，任何失败都不改会话或通道。
@@ -1178,6 +1251,9 @@ def finish_session(session_id: str) -> SessionStateResponse:
       推进/事件推进/接纳）均返回 404；
     - 不改动源场景、其他会话或此前返回的快照；不保存结束记录，
       会话不跨重启恢复（重启后同样按未知会话返回 404）。
+    - 若已开启补取通道，结束同时把该通道剩余未确认事件占用的进程内
+      共享容量全部归还（重复/并发结束不会重复释放），此后被容量阻塞
+      的其他会话生产请求可重试成功。
     """
     try:
         state = get_playback().finish(session_id)
